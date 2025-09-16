@@ -1,0 +1,125 @@
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: ci-cd-pipeline
+spec:
+  description: Clean workspace, clone repo, lint, test with nose, build image with buildah.
+  params:
+    - name: app-name
+      type: string
+      default: demo-app
+    - name: repo-url
+      type: string
+      description: Git repository URL
+      default: https://github.com/example/example-repo.git
+    - name: revision
+      type: string
+      default: main
+    - name: image
+      type: string
+      description: Full image to build/push
+      default: image-registry.openshift-image-registry.svc:5000/$(context.pipelineRun.namespace)/demo-app:latest
+    - name: context
+      type: string
+      default: .
+    - name: dockerfile
+      type: string
+      default: Dockerfile
+    - name: nose-args
+      type: string
+      default: "-v"
+  workspaces:
+    - name: output
+
+  tasks:
+    # 1) cleanup
+    - name: cleanup
+      taskRef:
+        name: cleanup
+      workspaces:
+        - name: source
+          workspace: output
+
+    # 2) git clone (ClusterTask)
+    - name: git-clone
+      runAfter: [cleanup]
+      taskRef:
+        kind: ClusterTask
+        name: git-clone
+      params:
+        - name: url
+          value: $(params.repo-url)
+        - name: revision
+          value: $(params.revision)
+        - name: deleteExisting
+          value: "true"
+      workspaces:
+        - name: output
+          workspace: output
+
+    # 3) flake8 linting (inline taskSpec so you don't need a separate Task)
+    - name: flake8-linting
+      runAfter: [git-clone]
+      taskSpec:
+        workspaces:
+          - name: source
+        steps:
+          - name: flake8
+            image: python:3.9-slim
+            workingDir: $(workspaces.source.path)
+            script: |
+              #!/bin/bash
+              set -e
+              python -m pip install --upgrade pip wheel
+              pip install -r requirements.txt
+              flake8 service --count --select=E9,F63,F7,F82 --show-source --statistics
+              flake8 service --count --max-complexity=10 --max-line-length=127 --statistics
+      workspaces:
+        - name: source
+          workspace: output
+
+    # 4) nose tests
+    - name: nose-tests
+      runAfter: [flake8-linting]
+      taskRef:
+        name: nose
+      params:
+        - name: args
+          value: $(params.nose-args)
+      workspaces:
+        - name: source
+          workspace: output
+
+    # 5) buildah (ClusterTask)
+    - name: buildah
+      runAfter: [nose-tests]
+      taskRef:
+        kind: ClusterTask
+        name: buildah
+      params:
+        - name: IMAGE
+          value: $(params.image)
+        - name: CONTEXT
+          value: $(params.context)
+        - name: DOCKERFILE
+          value: $(params.dockerfile)
+        - name: TLSVERIFY
+          value: "true" # set to "false" if your lab registry needs it
+      workspaces:
+        - name: source
+          workspace:
+            output
+            # 6) deploy with OpenShift client
+    - name: deploy
+      runAfter: [buildah]
+      taskRef:
+        kind: ClusterTask
+        name: openshift-client
+      params:
+        - name: SCRIPT
+          value: |
+            set -e
+            echo "Deploying $(params.app-name) with image $(params.image)"
+            oc create deployment $(params.app-name) \
+              --image=$(params.image) \
+              --dry-run=client -o yaml | oc apply -f -
